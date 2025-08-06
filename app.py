@@ -6,17 +6,20 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# ลิงก์ Google Drive (Direct download)
 DB_URL = "https://github.com/pailinvrs/arc01/releases/download/v1.0/arc01.sqlite"
-DB_PATH = "arc01.sqlite"  # ตั้งชื่อตรงกับไฟล์จริง
+DB_PATH = "arc01.sqlite"
+EXPECTED_SIZE_MB = 350  # ขนาดไฟล์ประมาณ
 
 def download_db():
-    if not os.path.exists(DB_PATH):
-        print("Downloading database from Google Drive...")
-        r = requests.get(DB_URL)
-        with open(DB_PATH, 'wb') as f:
-            f.write(r.content)
-        print("Database downloaded successfully.")
+    if not os.path.exists(DB_PATH) or os.path.getsize(DB_PATH) < EXPECTED_SIZE_MB * 1024 * 1024:
+        print("Downloading database from GitHub...")
+        with requests.get(DB_URL, stream=True) as r:
+            r.raise_for_status()
+            with open(DB_PATH, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        size_mb = os.path.getsize(DB_PATH) / (1024 * 1024)
+        print(f"Database downloaded successfully. Size: {size_mb:.2f} MB")
 
 # เรียกโหลด DB ตอนเริ่ม
 download_db()
@@ -44,5 +47,6 @@ def query_database(sql: str = Query(..., description="SQL query string")):
         return {"status": "ok", "data": result}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
 
 
