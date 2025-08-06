@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI()
 
 # ลิงก์ Google Drive (Direct download)
-DB_URL = "https://drive.google.com/uc?export=download&id=1d1iwFTPsVWffVw5KflnRc58_7Tj-4299"
+DB_URL = "https://github.com/pailinvrs/arc01/releases/download/v1.0/arc01.sqlite"
 DB_PATH = "arc01.sqlite"  # ตั้งชื่อตรงกับไฟล์จริง
 
 def download_db():
@@ -44,4 +44,5 @@ def query_database(sql: str = Query(..., description="SQL query string")):
         return {"status": "ok", "data": result}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
 
