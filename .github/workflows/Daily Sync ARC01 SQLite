@@ -24,22 +24,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run updater
+      - name: Build latest arc01.db
         env:
           API_BASE: https://archcu-digitaltwin.mamgistics.com
           DB_PATH: arc01.db
         run: |
           python scripts/update_sqlite.py
 
-      # ✅ สร้าง/อัปเดต release (แท็กคงที่) แล้วอัปโหลด arc01.db เป็น asset
-      - name: Upload arc01.db to release (tag=sqlite-latest)
-        uses: softprops/action-gh-release@v2
+      # ใส่ Upload/overwrite asset
+      - name: Upload/overwrite asset
+        uses: svenstaro/upload-release-action@v2
         with:
-          tag_name: sqlite-latest           # ใช้แท็กคงที่ → ดาวน์โหลดได้ URL เดิมทุกวัน
-          name: "ARC01 SQLite (latest)"
-          draft: false
-          prerelease: false
-          files: |
-            arc01.db
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: arc01.db
+          asset_name: arc01.db
+          tag: sqlite-latest           # ใช้ tag คงที่
+          release_name: "ARC01 SQLite (latest)"
+          overwrite: true              # ให้แทนที่ไฟล์เดิมได้
+          body: "Auto updated at ${{ github.run_id }}"
