@@ -12,13 +12,10 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    concurrency:
-      group: arc01-sqlite-daily
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -27,21 +24,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run sync
+      - name: Run updater
         env:
           API_BASE: https://archcu-digitaltwin.mamgistics.com
           DB_PATH: arc01.db
         run: |
-          python scripts/sync_sqlite_raw.py
+          python scripts/update_sqlite.py
 
-      - name: Commit & push if changed
-        run: |
-          if [ -n "$(git status --porcelain)" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add -A
-            git commit -m "chore(sqlite): daily raw sync at $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            git push
-          else
-            echo "No changes to commit."
-          fi
+      # ✅ สร้าง/อัปเดต release (แท็กคงที่) แล้วอัปโหลด arc01.db เป็น asset
+      - name: Upload arc01.db to release (tag=sqlite-latest)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlite-latest           # ใช้แท็กคงที่ → ดาวน์โหลดได้ URL เดิมทุกวัน
+          name: "ARC01 SQLite (latest)"
+          draft: false
+          prerelease: false
+          files: |
+            arc01.db
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
