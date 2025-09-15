@@ -1,4 +1,4 @@
-name: ARC01 SQLite — nightly overwrite (23:00 ICT)
+name: ARC01 SQLite — daily update (23:00 ICT)
 
 on:
   schedule:
