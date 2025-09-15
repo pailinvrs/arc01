@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-# update_sqlite.py — Incremental update Raw_State from Base API (keeping original schema)
+# update_sqlite.py — Incremental update Raw_State from Base API (start strictly after last in-DB per type)
+# - Keeps original schema (Raw_State id/timestamp/measurementLabel/state)
+# - No schema/index changes
+# - If a type has no rows in DB yet -> backfill only a small recent window (default 24h), not months
+
 import argparse, os, sys, time, json, sqlite3
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 import requests
 
-# ---------- Config via env/args ----------
+# -------- settings --------
 DEFAULT_TYPES = [
     "intemp","inhumid","inco2","inpm25","inpm10","intvoc",
     "inlight","inmotion","inpressure","current","occcount","battery"
 ]
-
-ICT = timezone(timedelta(hours=7))  # Bangkok time
-DEFAULT_START = "2025-03-26T00:00:00+07:00"  # first-available as per project notes
+ICT = timezone(timedelta(hours=7))
+# when a type has no rows in DB, fetch only this many hours back (NOT months)
+BACKFILL_HOURS_ON_EMPTY = int(os.getenv("BACKFILL_HOURS_ON_EMPTY", "24"))
 
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -20,26 +24,18 @@ def parse_args():
     ap.add_argument("--api-base", dest="api_base", required=True,
                     help="e.g., https://archcu-digitaltwin.mamgistics.com/arc01/api")
     ap.add_argument("--types", default=",".join(DEFAULT_TYPES))
-    ap.add_argument("--chunk-minutes-default", type=int, default=180)
+    ap.add_argument("--chunk-minutes-default", type=int, default=1440)   # 1 day
     ap.add_argument("--chunk-minutes-occcount", type=int, default=60)
     ap.add_argument("--retries", type=int, default=3)
     return ap.parse_args()
 
-# ---------- Helpers ----------
+# -------- helpers --------
 def iso_min(dt: datetime) -> str:
-    # API expects minute precision; timestamp is already in ICT
     return dt.astimezone(ICT).strftime("%Y-%m-%dT%H:%M")
 
 def parse_any_iso(s: str) -> datetime:
-    # Python 3.11 supports fromisoformat with TZ offsets like +07:00
-    try:
-        return datetime.fromisoformat(s)
-    except Exception:
-        # try without seconds
-        try:
-            return datetime.fromisoformat(s + ":00")
-        except Exception:
-            raise
+    # Python 3.11 handles tz offsets like "+07:00"
+    return datetime.fromisoformat(s)
 
 def http_get_json_or_ndjson(url: str, retries: int = 3):
     last_err = None
@@ -52,7 +48,7 @@ def http_get_json_or_ndjson(url: str, retries: int = 3):
                 return []
             if text.startswith("["):
                 return r.json()
-            # NDJSON
+            # NDJSON (one object per line)
             return [json.loads(line) for line in text.splitlines() if line.strip()]
         except Exception as e:
             last_err = e
@@ -60,14 +56,13 @@ def http_get_json_or_ndjson(url: str, retries: int = 3):
     raise last_err
 
 def ensure_raw_state_exists(conn: sqlite3.Connection):
-    # Keep original schema names/cases
+    # Keep original schema; create only if truly missing
     cur = conn.cursor()
     cur.execute("""
-        SELECT name FROM sqlite_master WHERE type='table' AND lower(name)=lower('Raw_State');
+        SELECT name FROM sqlite_master
+        WHERE type='table' AND lower(name)=lower('Raw_State');
     """)
-    row = cur.fetchone()
-    if not row:
-        # Create with your original columns
+    if not cur.fetchone():
         cur.execute("""
             CREATE TABLE Raw_State (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,38 +73,45 @@ def ensure_raw_state_exists(conn: sqlite3.Connection):
         """)
         conn.commit()
 
-def get_last_ts_for_type(conn: sqlite3.Connection, measurement_type: str) -> datetime:
+def get_last_ts_for_type(conn: sqlite3.Connection, measurement_type: str) -> datetime | None:
     """
-    Use MIM mapping to find last timestamp PER TYPE.
-    If no rows found, return DEFAULT_START in ICT.
+    Return the latest timestamp in DB for the given measurement_type.
+    If no rows exist for that type, return None.
     """
     q = """
     SELECT MAX(rs.timestamp)
     FROM Raw_State rs
     JOIN mim m ON rs.measurementLabel = m.measurementLabel
-    WHERE m.measurementType = ?
+    WHERE lower(m.measurementType) = lower(?)
     """
     cur = conn.execute(q, (measurement_type,))
     val = cur.fetchone()[0] if cur else None
-    if val:
-        return parse_any_iso(val)
-    return datetime.fromisoformat(DEFAULT_START)
+    return parse_any_iso(val) if val else None
 
-def insert_rows(conn: sqlite3.Connection, rows):
+def insert_rows_dedup(conn: sqlite3.Connection, rows):
     """
+    Insert with per-row NOT EXISTS guard (no schema change required).
     rows: list of (timestamp:str, measurementLabel:str, state:float)
     """
     if not rows:
         return 0
     cur = conn.cursor()
     cur.executemany(
-        "INSERT INTO Raw_State(timestamp, measurementLabel, state) VALUES (?, ?, ?)",
-        rows
+        """
+        INSERT INTO Raw_State(timestamp, measurementLabel, state)
+        SELECT ?, ?, ?
+        WHERE NOT EXISTS (
+          SELECT 1 FROM Raw_State
+          WHERE timestamp = ? AND measurementLabel = ?
+        )
+        """,
+        [(ts, lab, st, ts, lab) for (ts, lab, st) in rows]
     )
     conn.commit()
-    return len(rows)
+    # rowcount on executemany may not reflect total inserted; re-count via changes()
+    return conn.total_changes
 
-# ---------- Main incremental ----------
+# -------- main incremental --------
 def run():
     args = parse_args()
     api_base = args.api_base.rstrip("/")
@@ -119,29 +121,31 @@ def run():
     ensure_raw_state_exists(conn)
 
     now_ict = datetime.now(ICT)
-
     total_inserted = 0
+
     for t in types:
-        # 1) last-ts per type via MIM
         last_dt = get_last_ts_for_type(conn, t)
 
-        # ถ้าข้อมูลใน DB ล้ำหน้า now (ไม่ควรเกิด) ให้ถอยกลับเล็กน้อย
-        if last_dt > now_ict:
-            last_dt = now_ict - timedelta(minutes=5)
+        if last_dt is None:
+            # No rows of this type in DB yet -> start only a small recent window (avoid months of backfill)
+            start_dt = now_ict - timedelta(hours=BACKFILL_HOURS_ON_EMPTY)
+            mode = f"INIT (no rows in DB; start last {BACKFILL_HOURS_ON_EMPTY}h)"
+        else:
+            # Start strictly after last timestamp to avoid duplicates
+            start_dt = last_dt + timedelta(seconds=1)
+            mode = f"APPEND (after {iso_min(last_dt)})"
 
-        # Start strictly after last timestamp to avoid duplicates
-        start_dt = last_dt + timedelta(seconds=1)
-        end_dt   = now_ict
-
+        end_dt = now_ict
         if start_dt >= end_dt:
-            print(f"[{t}] up-to-date (<= {iso_min(end_dt)})")
+            print(f"[{t}] up-to-date (no fetch). {mode}")
             continue
 
         chunk_minutes = args.chunk_minutes_occcount if t == "occcount" else args.chunk_minutes_default
-        print(f"[{t}] range {iso_min(start_dt)} → {iso_min(end_dt)} (chunk={chunk_minutes}m)")
+        print(f"[{t}] {mode} → range {iso_min(start_dt)} → {iso_min(end_dt)} (chunk={chunk_minutes}m)")
 
         t0 = start_dt
-        type_inserts = 0
+        type_inserts_before = total_inserted
+
         while t0 < end_dt:
             t1 = min(t0 + timedelta(minutes=chunk_minutes), end_dt)
             qs = urlencode({"from": iso_min(t0), "to": iso_min(t1)})
@@ -154,33 +158,38 @@ def run():
                     for it in items:
                         try:
                             ts = str(it["timestamp"]).strip()
-                            label = str(it["measurementLabel"]).strip()
-                            state = float(it["state"])
-                            # guard: keep only rows strictly > last_dt
-                            if parse_any_iso(ts) > last_dt:
-                                batch.append((ts, label, state))
+                            lab = str(it["measurementLabel"]).strip()
+                            st  = float(it["state"])
+                            # keep only rows strictly after last_dt (if last_dt exists)
+                            if (last_dt is None) or (parse_any_iso(ts) > last_dt):
+                                batch.append((ts, lab, st))
                         except Exception:
-                            # skip malformed
                             continue
                     if batch:
-                        n = insert_rows(conn, batch)
-                        type_inserts += n
-                        print(f"  + {iso_min(t0)}–{iso_min(t1)} → {n} rows")
+                        # per-chunk dedup against DB
+                        before = total_inserted
+                        inserted_now = insert_rows_dedup(conn, batch)
+                        total_inserted += inserted_now
+                        print(f"  + {iso_min(t0)}–{iso_min(t1)} → ask:{len(batch)} ins:{inserted_now}")
                 else:
                     print(f"  . {iso_min(t0)}–{iso_min(t1)} → 0 rows")
             except Exception as e:
-                # fail the whole run (as requested)
                 print(f"  ! {iso_min(t0)}–{iso_min(t1)} FAILED: {e}", file=sys.stderr)
                 sys.exit(1)
 
             t0 = t1
-            time.sleep(0.15)
+            time.sleep(0.1)
 
-        print(f"[{t}] done: inserted {type_inserts} rows")
-        total_inserted += type_inserts
+        print(f"[{t}] done: inserted {total_inserted - type_inserts_before} rows")
 
-    # Summary
     print(f"[summary] inserted total {total_inserted} rows into {args.db_path}")
+
+    # Let workflow know whether to upload or skip
+    out = os.getenv("INSERTED_FILE")
+    if out:
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(str(total_inserted))
 
 if __name__ == "__main__":
     run()
