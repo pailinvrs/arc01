@@ -1,217 +1,186 @@
 #!/usr/bin/env python3
-# update_sqlite.py — sync ARC01 SQLite (AIM/MIM full upsert + Raw_State incremental)
-import os, time, requests, sqlite3
+# update_sqlite.py — Incremental update Raw_State from Base API (keeping original schema)
+import argparse, os, sys, time, json, sqlite3
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
+import requests
 
-API_BASE = os.getenv("API_BASE", "https://archcu-digitaltwin.mamgistics.com")
-DB_PATH  = os.getenv("DB_PATH", "arc01.db")
-
-ICT = timezone(timedelta(hours=7))  # Bangkok
-
-# ทั้งหมดตามเอกสาร + ที่คุณเพิ่ม
-BASE_TYPES = [
+# ---------- Config via env/args ----------
+DEFAULT_TYPES = [
     "intemp","inhumid","inco2","inpm25","inpm10","intvoc",
-    "inlight","inmotion","inpressure",
-    "current","occcount","battery"
+    "inlight","inmotion","inpressure","current","occcount","battery"
 ]
 
-# ลองทั้ง 2 เส้นทาง (บางระบบตั้ง base path ต่างกัน)
-API_PREFIXES = ["/arc01/api", ""]
+ICT = timezone(timedelta(hours=7))  # Bangkok time
+DEFAULT_START = "2025-03-26T00:00:00+07:00"  # first-available as per project notes
 
-def ensure_schema(conn: sqlite3.Connection):
-    cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS Raw_State(
-        timestamp TEXT NOT NULL,
-        measurementLabel TEXT NOT NULL,
-        state REAL NOT NULL,
-        PRIMARY KEY (timestamp, measurementLabel)
-    );""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS MIM(
-        measurementLabel TEXT PRIMARY KEY,
-        measurementType TEXT,
-        zoneName TEXT,
-        deviceFriendlyName TEXT
-    );""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS AIM(
-        deviceFriendlyName TEXT PRIMARY KEY,
-        building TEXT, floor TEXT, room TEXT,
-        deviceClass TEXT, macAddress TEXT, ipAddress TEXT
-    );""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS Meta(
-        source_key TEXT PRIMARY KEY,
-        last_ts TEXT
-    );""")
-    conn.commit()
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--db", dest="db_path", required=True)
+    ap.add_argument("--api-base", dest="api_base", required=True,
+                    help="e.g., https://archcu-digitaltwin.mamgistics.com/arc01/api")
+    ap.add_argument("--types", default=",".join(DEFAULT_TYPES))
+    ap.add_argument("--chunk-minutes-default", type=int, default=180)
+    ap.add_argument("--chunk-minutes-occcount", type=int, default=60)
+    ap.add_argument("--retries", type=int, default=3)
+    return ap.parse_args()
 
-# ---------- helpers ----------
-def fmt_min(dt: datetime) -> str:
+# ---------- Helpers ----------
+def iso_min(dt: datetime) -> str:
+    # API expects minute precision; timestamp is already in ICT
     return dt.astimezone(ICT).strftime("%Y-%m-%dT%H:%M")
 
-def parse_dt_guess(s: str) -> datetime:
-    s = (s or "").strip()
-    for fmt in ("%Y-%m-%dT%H:%M:%S%z","%Y-%m-%dT%H:%M%z","%Y-%m-%dT%H:%M"):
+def parse_any_iso(s: str) -> datetime:
+    # Python 3.11 supports fromisoformat with TZ offsets like +07:00
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        # try without seconds
         try:
-            dt = datetime.strptime(s, fmt)
-            return dt if dt.tzinfo else dt.replace(tzinfo=ICT)
-        except ValueError:
-            continue
-    return datetime.now(ICT) - timedelta(hours=36)
+            return datetime.fromisoformat(s + ":00")
+        except Exception:
+            raise
 
-def get_json(path_no_prefix: str, params=None):
+def http_get_json_or_ndjson(url: str, retries: int = 3):
     last_err = None
-    for p in API_PREFIXES:
-        url = f"{API_BASE}{p}{path_no_prefix}"
+    for _ in range(max(1, retries)):
         try:
-            r = requests.get(url, params=params or {}, timeout=60)
-            if r.status_code == 404:
-                last_err = f"404 {url}"
-                continue
+            r = requests.get(url, timeout=60)
             r.raise_for_status()
-            data = r.json()
-            return data, url
+            text = r.text.strip()
+            if not text:
+                return []
+            if text.startswith("["):
+                return r.json()
+            # NDJSON
+            return [json.loads(line) for line in text.splitlines() if line.strip()]
         except Exception as e:
-            last_err = f"{type(e).__name__}: {e} @ {url}"
-            continue
-    raise RuntimeError(last_err or "all prefixes failed")
+            last_err = e
+            time.sleep(1.0)
+    raise last_err
 
-# ---------- sync AIM/MIM (เต็มแทนที่แบบ upsert) ----------
-def sync_mim(conn: sqlite3.Connection):
-    data, used_url = get_json("/mim")
-    if not isinstance(data, list): return 0, used_url
+def ensure_raw_state_exists(conn: sqlite3.Connection):
+    # Keep original schema names/cases
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT name FROM sqlite_master WHERE type='table' AND lower(name)=lower('Raw_State');
+    """)
+    row = cur.fetchone()
+    if not row:
+        # Create with your original columns
+        cur.execute("""
+            CREATE TABLE Raw_State (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                measurementLabel TEXT,
+                state REAL
+            );
+        """)
+        conn.commit()
+
+def get_last_ts_for_type(conn: sqlite3.Connection, measurement_type: str) -> datetime:
+    """
+    Use MIM mapping to find last timestamp PER TYPE.
+    If no rows found, return DEFAULT_START in ICT.
+    """
+    q = """
+    SELECT MAX(rs.timestamp)
+    FROM Raw_State rs
+    JOIN mim m ON rs.measurementLabel = m.measurementLabel
+    WHERE m.measurementType = ?
+    """
+    cur = conn.execute(q, (measurement_type,))
+    val = cur.fetchone()[0] if cur else None
+    if val:
+        return parse_any_iso(val)
+    return datetime.fromisoformat(DEFAULT_START)
+
+def insert_rows(conn: sqlite3.Connection, rows):
+    """
+    rows: list of (timestamp:str, measurementLabel:str, state:float)
+    """
+    if not rows:
+        return 0
     cur = conn.cursor()
     cur.executemany(
-        "INSERT INTO MIM(measurementLabel,measurementType,zoneName,deviceFriendlyName) "
-        "VALUES(?,?,?,?) "
-        "ON CONFLICT(measurementLabel) DO UPDATE SET "
-        "measurementType=excluded.measurementType, "
-        "zoneName=excluded.zoneName, "
-        "deviceFriendlyName=excluded.deviceFriendlyName",
-        [
-            (
-                d.get("measurementLabel"),
-                d.get("measurementType"),
-                d.get("zoneName"),
-                d.get("deviceFriendlyName"),
-            )
-            for d in data
-            if d.get("measurementLabel")
-        ],
-    )
-    conn.commit()
-    return len(data), used_url
-
-def sync_aim(conn: sqlite3.Connection):
-    data, used_url = get_json("/aim")
-    if not isinstance(data, list): return 0, used_url
-    cur = conn.cursor()
-    cur.executemany(
-        "INSERT INTO AIM(deviceFriendlyName,building,floor,room,deviceClass,macAddress,ipAddress) "
-        "VALUES(?,?,?,?,?,?,?) "
-        "ON CONFLICT(deviceFriendlyName) DO UPDATE SET "
-        "building=excluded.building, floor=excluded.floor, room=excluded.room, "
-        "deviceClass=excluded.deviceClass, macAddress=excluded.macAddress, ipAddress=excluded.ipAddress",
-        [
-            (
-                d.get("deviceFriendlyName"),
-                d.get("building"), d.get("floor"), d.get("room"),
-                d.get("deviceClass"), d.get("macAddress"), d.get("ipAddress"),
-            )
-            for d in data
-            if d.get("deviceFriendlyName")
-        ],
-    )
-    conn.commit()
-    return len(data), used_url
-
-# ---------- Raw_State incremental ----------
-def meta_get(conn, key, default_ts=None):
-    row = conn.execute("SELECT last_ts FROM Meta WHERE source_key=?", (key,)).fetchone()
-    return row[0] if row and row[0] else default_ts
-
-def meta_set(conn, key, ts_str):
-    conn.execute(
-        "INSERT INTO Meta(source_key,last_ts) VALUES(?,?) "
-        "ON CONFLICT(source_key) DO UPDATE SET last_ts=excluded.last_ts",
-        (key, ts_str),
-    )
-    conn.commit()
-
-def fetch_range(base_type: str, start_dt: datetime, end_dt: datetime):
-    return get_json(f"/range/{base_type}", params={"from": fmt_min(start_dt), "to": fmt_min(end_dt)})
-
-def upsert_raw(conn: sqlite3.Connection, rows):
-    conn.executemany(
-        "INSERT INTO Raw_State(timestamp,measurementLabel,state) VALUES(?,?,?) "
-        "ON CONFLICT(timestamp,measurementLabel) DO UPDATE SET state=excluded.state",
+        "INSERT INTO Raw_State(timestamp, measurementLabel, state) VALUES (?, ?, ?)",
         rows
     )
     conn.commit()
+    return len(rows)
 
-def main():
-    conn = sqlite3.connect(DB_PATH)
-    ensure_schema(conn)
+# ---------- Main incremental ----------
+def run():
+    args = parse_args()
+    api_base = args.api_base.rstrip("/")
+    types = [t.strip() for t in args.types.split(",") if t.strip()]
 
-    # 1) อัปเดต AIM/MIM ทุกครั้ง (ข้อมูลเล็ก)
-    try:
-        n_mim, url_mim = sync_mim(conn)
-        print(f"[MIM] upsert {n_mim} rows via {url_mim}")
-    except Exception as e:
-        print(f"[MIM] skip: {e}")
-    try:
-        n_aim, url_aim = sync_aim(conn)
-        print(f"[AIM] upsert {n_aim} rows via {url_aim}")
-    except Exception as e:
-        print(f"[AIM] skip: {e}")
+    conn = sqlite3.connect(args.db_path)
+    ensure_raw_state_exists(conn)
 
-    # 2) อัปเดต Raw_State แบบ incremental
-    now = datetime.now(ICT)
-    backfill_hours = int(os.getenv("BACKFILL_HOURS", "72"))  # รอบแรกดึงย้อนไปกี่ชั่วโมง
+    now_ict = datetime.now(ICT)
 
-    total_all = 0
-    for t in BASE_TYPES:
-        key = f"base:{t}"
-        last_ts = meta_get(conn, key, default_ts=(now - timedelta(hours=backfill_hours)).strftime("%Y-%m-%dT%H:%M"))
-        start_dt = parse_dt_guess(last_ts) - timedelta(minutes=5)  # overlap 5 นาที
-        end_dt   = now
-        chunk = 60 if t == "occcount" else 180
+    total_inserted = 0
+    for t in types:
+        # 1) last-ts per type via MIM
+        last_dt = get_last_ts_for_type(conn, t)
 
-        print(f"[sync] {t}: {fmt_min(start_dt)} → {fmt_min(end_dt)} (chunk={chunk}m)")
+        # ถ้าข้อมูลใน DB ล้ำหน้า now (ไม่ควรเกิด) ให้ถอยกลับเล็กน้อย
+        if last_dt > now_ict:
+            last_dt = now_ict - timedelta(minutes=5)
+
+        # Start strictly after last timestamp to avoid duplicates
+        start_dt = last_dt + timedelta(seconds=1)
+        end_dt   = now_ict
+
+        if start_dt >= end_dt:
+            print(f"[{t}] up-to-date (<= {iso_min(end_dt)})")
+            continue
+
+        chunk_minutes = args.chunk_minutes_occcount if t == "occcount" else args.chunk_minutes_default
+        print(f"[{t}] range {iso_min(start_dt)} → {iso_min(end_dt)} (chunk={chunk_minutes}m)")
+
         t0 = start_dt
-        type_total = 0
-        used_url = None
+        type_inserts = 0
         while t0 < end_dt:
-            t1 = min(t0 + timedelta(minutes=chunk), end_dt)
+            t1 = min(t0 + timedelta(minutes=chunk_minutes), end_dt)
+            qs = urlencode({"from": iso_min(t0), "to": iso_min(t1)})
+            url = f"{api_base}/range/{t}?{qs}"
+
             try:
-                items, used_url = fetch_range(t, t0, t1)
-                n = len(items or [])
-                if n:
-                    rows = []
+                items = http_get_json_or_ndjson(url, retries=args.retries)
+                if items:
+                    batch = []
                     for it in items:
                         try:
-                            rows.append((str(it["timestamp"]).strip(),
-                                         str(it["measurementLabel"]).strip(),
-                                         float(it["state"])))
+                            ts = str(it["timestamp"]).strip()
+                            label = str(it["measurementLabel"]).strip()
+                            state = float(it["state"])
+                            # guard: keep only rows strictly > last_dt
+                            if parse_any_iso(ts) > last_dt:
+                                batch.append((ts, label, state))
                         except Exception:
+                            # skip malformed
                             continue
-                    if rows:
-                        upsert_raw(conn, rows)
-                        type_total += len(rows)
-                print(f"  + {fmt_min(t0)}–{fmt_min(t1)} → {n} rec")
+                    if batch:
+                        n = insert_rows(conn, batch)
+                        type_inserts += n
+                        print(f"  + {iso_min(t0)}–{iso_min(t1)} → {n} rows")
+                else:
+                    print(f"  . {iso_min(t0)}–{iso_min(t1)} → 0 rows")
             except Exception as e:
-                print(f"  ! {fmt_min(t0)}–{fmt_min(t1)} FAILED: {e}")
+                # fail the whole run (as requested)
+                print(f"  ! {iso_min(t0)}–{iso_min(t1)} FAILED: {e}", file=sys.stderr)
+                sys.exit(1)
+
             t0 = t1
-            time.sleep(0.2)
+            time.sleep(0.15)
 
-        meta_set(conn, key, now.strftime("%Y-%m-%dT%H:%M"))
-        print(f"[done] {t}: {type_total} rows via {used_url}")
-        total_all += type_total
+        print(f"[{t}] done: inserted {type_inserts} rows")
+        total_inserted += type_inserts
 
-    # summary
-    try:
-        size = os.path.getsize(DB_PATH)
-    except Exception:
-        size = -1
-    print(f"[summary] total rows changed ≈ {total_all}, db={DB_PATH}, size={size} bytes")
+    # Summary
+    print(f"[summary] inserted total {total_inserted} rows into {args.db_path}")
 
 if __name__ == "__main__":
-    main()
+    run()
