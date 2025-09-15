@@ -8,10 +8,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: arc01-sqlite-refresh
+  cancel-in-progress: true
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - uses: actions/checkout@v4
@@ -25,44 +29,41 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests python-dateutil
 
-      - name: Download current arc01.db from Release v1.0 (with fallback)
+      # ⬇️ ดึงฐาน .sqlite จาก Release tag v1.0 (ไม่มี fallback .db)
+      - name: Download current arc01.sqlite from Release v1.0
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           mkdir -p build
-          gh release download v1.0 --pattern "arc01.db" --dir build || true
-          if [ ! -f build/arc01.db ]; then
-            echo "arc01.db not found; trying legacy arc01.sqlite..."
-            gh release download v1.0 --pattern "arc01.sqlite" --dir build || true
-            if [ -f build/arc01.sqlite ]; then
-              cp build/arc01.sqlite build/arc01.db
-              echo "Copied arc01.sqlite -> arc01.db for this run."
-            else
-              echo "No arc01.db or arc01.sqlite in release v1.0; aborting."
-              exit 1
-            fi
-          fi
+          gh release download v1.0 --pattern "arc01.sqlite" --dir build
+          test -f build/arc01.sqlite
 
+      # ⬇️ อัปเดตแบบ incremental ตามที่ตั้งไว้ (ใช้ไฟล์ .sqlite)
       - name: Incremental update (Base API only)
         env:
           API_BASE: https://archcu-digitaltwin.mamgistics.com/arc01/api
-          DB_PATH: build/arc01.db
+          DB_PATH: build/arc01.sqlite
+          BACKFILL_HOURS_ON_EMPTY: 24
         run: |
-          python update_sqlite.py --db "$DB_PATH" --api-base "$API_BASE"
+          python update_sqlite.py \
+            --db "$DB_PATH" \
+            --api-base "$API_BASE" \
+            --chunk-minutes-default 1440 \
+            --chunk-minutes-occcount 60
 
-      - name: Integrity check & vacuum
+      - name: Integrity check
         run: |
-          echo "PRAGMA integrity_check;" | sqlite3 build/arc01.db
-          sqlite3 build/arc01.db "VACUUM;"
+          echo "PRAGMA integrity_check;" | sqlite3 build/arc01.sqlite
 
-      - name: Upload/overwrite asset to tag v1.0
+      # ⬇️ อัปทับไฟล์เดิมชื่อเดิม (arc01.sqlite) ที่ tag v1.0
+      - name: Upload/overwrite asset (arc01.sqlite) to tag v1.0
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: build/arc01.db
-          asset_name: arc01.db
+          file: build/arc01.sqlite
+          asset_name: arc01.sqlite
           tag: v1.0
           release_name: "ARC01 SQLite (latest)"
           overwrite: true
-          body: "Auto-updated at (ICT): $(TZ=Asia/Bangkok date +'%Y-%m-%d %H:%M:%S %z')"
+          body: "Auto-updated by GitHub Actions"
